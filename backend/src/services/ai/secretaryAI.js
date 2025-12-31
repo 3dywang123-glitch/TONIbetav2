@@ -3,18 +3,33 @@ const config = require('../../config/config');
 const { getSecretaryPrompt } = require('../../core/prompts/secretary');
 const { getExpertIdByName } = require('../../core/intents');
 
-async function callSecretaryAI(text, imageBase64, secretaryStyle = 'cute') {
-  if (!config.aiEndpoint) {
+async function callSecretaryAI(text, imageBase64, secretaryStyle = 'cute', modelApiUrl = null, modelCode = null) {
+  // 使用传入的模型API URL，或从环境变量获取，或使用默认值
+  const apiUrl = modelApiUrl || config.modelApiUrl || config.aiEndpoint;
+  if (!apiUrl) {
     throw new Error('AI endpoint not configured');
   }
+
+  // 使用传入的模型代码，或从环境变量获取
+  const model = modelCode || process.env.MODEL_CODE || process.env.SECRETARY_MODEL || 'gpt-4o-mini';
 
   try {
     const systemPrompt = getSecretaryPrompt(secretaryStyle);
     const userPrompt = `用户输入: ${text}`;
 
+    // 构建请求URL（如果提供了模型代码，可能需要添加到URL中）
+    let requestUrl = apiUrl;
+    if (modelCode && apiUrl.includes('aihub.zeabur.ai')) {
+      // 对于Zeabur AI Hub，模型代码可能需要作为路径参数
+      requestUrl = `${apiUrl.replace(/\/$/, '')}/v1/chat/completions`;
+    } else if (!apiUrl.includes('/v1/chat/completions') && !apiUrl.includes('/chat/completions')) {
+      // 如果URL不包含完整路径，添加标准路径
+      requestUrl = `${apiUrl.replace(/\/$/, '')}/v1/chat/completions`;
+    }
+
     // Prepare request for OpenAI-compatible API
     const requestBody = {
-      model: process.env.SECRETARY_MODEL || 'gpt-4o-mini',
+      model: model,
       messages: [
         {
           role: 'system',
@@ -40,10 +55,10 @@ async function callSecretaryAI(text, imageBase64, secretaryStyle = 'cute') {
       max_tokens: 500,
     };
 
-    const response = await axios.post(config.aiEndpoint, requestBody, {
+    const response = await axios.post(requestUrl, requestBody, {
       headers: {
         'Content-Type': 'application/json',
-        Authorization: `Bearer ${process.env.OPENAI_API_KEY || ''}`,
+        Authorization: `Bearer ${process.env.OPENAI_API_KEY || process.env.AIHUB_API_KEY || ''}`,
       },
       timeout: 30000,
     });

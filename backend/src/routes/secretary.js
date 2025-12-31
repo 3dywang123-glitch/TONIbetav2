@@ -8,7 +8,7 @@ router.post('/', async (req, res) => {
   let sessionId = req.body.session_id || `session_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
   
   try {
-    const { text, image, secretary_style, device_ip } = req.body;
+    const { text, image, secretary_style, device_ip, model_api_url, model_code } = req.body;
 
     if (!text) {
       return res.status(400).json({
@@ -44,7 +44,7 @@ router.post('/', async (req, res) => {
     // Get secretary style (default: cute)
     const secretaryStyle = secretary_style || 'cute';
 
-    const result = await callSecretaryAI(text, base64Data, secretaryStyle);
+    const result = await callSecretaryAI(text, base64Data, secretaryStyle, model_api_url, model_code);
     const responseTime = Date.now() - startTime;
 
     // Save to database

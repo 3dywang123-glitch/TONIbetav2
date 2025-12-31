@@ -8,7 +8,7 @@ router.post('/', async (req, res) => {
   const { session_id } = req.body;
   
   try {
-    const { user_context, secretary_context, image, pic_require, expert, burst_images } = req.body;
+    const { user_context, secretary_context, image, pic_require, expert, burst_images, model_api_url, model_code } = req.body;
 
     if (!user_context || !image) {
       return res.status(400).json({
@@ -46,7 +46,9 @@ router.post('/', async (req, res) => {
       secretary_context || '',
       base64Data,
       expertName,
-      burstImagesBase64 // 传递连拍图像
+      burstImagesBase64, // 传递连拍图像
+      model_api_url,
+      model_code
     );
     const responseTime = Date.now() - startTime;
 

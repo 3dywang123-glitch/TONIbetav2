@@ -14,6 +14,13 @@ PORT=3000
 SECRETARY_MODEL=gpt-4o-mini
 EXPERT_MODEL=gpt-4o
 
+# AI Hub Configuration (optional, for Zeabur AI Hub)
+MODEL_API_URL=https://hnd1.aihub.zeabur.ai/
+MODEL_CODE=claude-sonnet-4-5
+# Available models: claude-sonnet-4-5, gemini-3-pro-preview, gemini-3-flash-preview, 
+# gpt-5, grok-4-fast-non-reasoning, deepseek-v3.2, qwen-3-32, kimi-k2-thinking
+AIHUB_API_KEY=your_aihub_api_key_here
+
 # Database Configuration (Zeabur PostgreSQL)
 DATABASE_URL=postgresql://root:Y3hfVlg9avGid6jrWEc18FCu25N70wM4@sha1.clusters.zeabur.com:32744/zeabur
 ```
