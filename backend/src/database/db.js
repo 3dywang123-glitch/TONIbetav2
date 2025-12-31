@@ -4,7 +4,7 @@ const config = require('../config/config');
 // Create PostgreSQL connection pool
 const pool = new Pool({
   connectionString: config.databaseUrl,
-  ssl: config.databaseUrl.includes('zeabur.com') ? { rejectUnauthorized: false } : false,
+  ssl: false, // Zeabur PostgreSQL may not support SSL, set to false for compatibility
   max: 20, // Maximum number of clients in the pool
   idleTimeoutMillis: 30000,
   connectionTimeoutMillis: 2000,
