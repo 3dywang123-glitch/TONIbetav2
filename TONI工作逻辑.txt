@@ -1,0 +1,135 @@
+1. 网络连接与硬件发现 (Connectivity Architecture)
+原则：全场景无感连接，协议栈自动回落。
+
+场景 A：基础设施模式 (Office/Home WiFi)
+
+拓扑：Toni 和 手机都连在同一个路由器下。
+
+发现：App 启动时向 255.255.255.255:8888 发送 UDP 广播 WHO_IS_TONI?。
+
+握手：Toni 收到后回复 I_AM_TONI,IP=192.168.x.x。App 自动锁定该 IP。
+
+场景 B：移动热点模式 (Mobile Hotspot)
+
+拓扑：Toni 自动连接手机开启的热点。
+
+发现：同上，通过 UDP 广播握手（因为在同一网段，广播依然有效）。
+
+场景 C：冷启动/配网模式 (Provisioning)
+
+触发：Toni 开机连不上网，呼吸灯进入“慢闪”状态，开启低功耗蓝牙 (BLE)。
+
+操作：用户在 App 设置页点击“蓝牙配网”，扫描 TONI_PROV，写入 WiFi 凭证。
+
+结果：Toni 重启并进入场景 A 或 B。
+
+2. 硬件端执行逻辑 (Device Firmware Flow)
+
+原则：三级跳拍摄，激光战术校准。
+
+T+0.0s (唤醒)：收到触发指令。
+
+T+0.1s (热机 1)：
+
+动作：静默抓拍 第一张 VGA (640x480)。
+
+处理：弃用 (内部销毁)。仅用于唤醒 ISP 和 AEC。
+
+T+0.6s (秘书图)：
+
+动作：抓拍 第二张 VGA (640x480)。
+
+处理：回传给 App。这是给秘书 AI 看的“探路图”。
+
+激光：此时启动 4点框激光器，开始战术闪烁序列（模拟对焦）。
+
+0.6s - 2.0s：慢闪 (500ms 周期)。
+
+T+2.0s (热机 2)：
+
+动作：抓拍 第一张 QXGA (2048x1536)。
+
+处理：弃用。用于让 ISP 适应高分辨率和高帧率负载。
+
+激光：频率加快。
+
+2.0s - 2.6.s：快闪 (100ms 周期)。
+
+2.6-2.9：常亮
+
+T+3.0s (决战图)：
+
+动作：激光常亮 / 补光灯开 -> 抓拍 第二张 QXGA (2048x1536)。
+
+处理：回传给 App。这是给专家 AI 看的“最终图”。
+
+用“UDP信令+HTTP取图”的方案来实现自动推送效果
+
+3. App 端逻辑中枢 (Client Core Logic)
+原则：异步并发，分级响应，本地裁剪。
+
+听觉轨道 (Audio Track)：
+
+VAD 启动：检测到人声，开始流式识别。
+
+节点 1 (第一句)：当识别出第一个完整的句子（或前 3-5 秒的内容）时 -> 标记为 [First_Command]。
+
+节点 2 (全对话)：继续录音，直到用户彻底闭嘴（静默检测） -> 标记为 [Full_Context]。
+
+视觉轨道 (Visual Track)：
+
+接收图A：收到 VGA 小图 -> 存入 Cache_A。
+
+接收图B：收到 3MP 大图 -> 存入 Cache_B。
+
+本地裁剪：App 自动将 Cache_B 居中裁剪为 540x720 -> 存入 Cache_C。
+
+4. 后台交互与 AI 决策 (Backend & AI)
+
+原则：上下文衔接，角色扮演。
+
+第一轮：秘书 AI (The Secretary)
+触发：当 [First_Command] 和 [图A] 就绪时。
+
+输入：
+
+text: "帮我看下这个..."
+
+image: 图A (VGA)。
+
+输出：
+
+reply: "收到，这看起来像是个断路器，我找老王来。" (播报给用户)
+
+expert: "electrician"
+
+camera_action: "normal" (默认) 或 "wide" (全景)
+
+第二轮：专家 AI (The Expert)
+
+触发：当 [Full_Context]、[图B] 和 秘书指令 就绪时。
+
+输入：
+
+user_context: [Text_Full] (完整用户语境)
+
+secretary_context: 秘书刚才的回复内容 (用于语气衔接)
+
+image:
+
+若 pic require == "normal" -> 发送 图C (裁剪)。
+
+若 pic require == "wide" -> 发送 图B (原图)。
+
+Prompt：
+
+"你的秘书刚才对用户说：'{secretary_context}'。请承接这句话，基于这张高清图片，回答用户的完整问题：'{user_context}'。"
+
+5. 异常处理与连拍 (Burst Logic)
+连拍逻辑：
+
+如果进入连拍模式，App 不会 丢弃 T3.0s 拍的那张高清图，而是将其标记为 Burst_Image_1。
+
+App 发送指令 GET /burst?count=4 让板子补拍剩下的图。
+
+最终发给专家的是 [Img1, Img2, Img3, Img4, Img5]。

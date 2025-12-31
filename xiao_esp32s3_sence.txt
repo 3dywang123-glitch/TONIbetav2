@@ -1,0 +1,358 @@
+#include "esp_camera.h"
+#include <WiFi.h>
+#include <WiFiUdp.h>
+#include <Preferences.h>
+#include <WebServer.h>
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEServer.h>
+
+// ================= 硬件引脚 =================
+#define BTN_FUNC_PIN 1  // D0
+#define LED_PIN      2  // D1
+#define LASER_PIN    3  // D2
+#define BTN_TRIG_PIN 4  // D3
+
+// ================= 蓝牙配网 =================
+#define SERVICE_UUID        "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
+#define CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"
+#define DEVICE_NAME         "TONI_PROV"
+
+// ================= 系统变量 =================
+#define UDP_PORT 8888
+Preferences preferences;
+WiFiUDP Udp;
+WebServer server(80);
+char packetBuffer[255];
+
+// 图像缓冲区 (存 PSRAM)
+camera_fb_t * fb_vga = NULL;  // 秘书图
+camera_fb_t * fb_hd = NULL;   // 专家图
+
+// 状态机
+enum SystemState { STATE_BOOT, STATE_PROVISION, STATE_CONNECTING, STATE_RUNNING };
+SystemState sysState = STATE_BOOT;
+
+enum TacState { IDLE, START, SNAP_VGA, WARMUP, SNAP_HD, DONE };
+TacState tacState = IDLE;
+unsigned long tacTimer = 0;
+bool isArmed = true;
+bool funcBtnPressed = false;
+unsigned long funcBtnTime = 0;
+
+// ================= 函数声明 =================
+void setupCamera();
+void startBleProvisioning();
+void handleUdpDiscovery();
+void handlePhysicalControls();
+void runAutonomousSequence();
+void takePictureToBuffer(int slot);
+void enterDeepSleep();
+
+// ================= 蓝牙回调 =================
+class MyCallbacks: public BLECharacteristicCallbacks {
+    void onWrite(BLECharacteristic *pCharacteristic) {
+      String value = pCharacteristic->getValue();
+      if (value.length() > 0) {
+        Serial.println("📱 BLE: " + value);
+        int commaIndex = value.indexOf(',');
+        if (commaIndex != -1) {
+          String ssid = value.substring(0, commaIndex);
+          String pass = value.substring(commaIndex + 1);
+          preferences.begin("wifi_config", false);
+          preferences.putString("ssid", ssid);
+          preferences.putString("pass", pass);
+          preferences.end();
+          delay(500); ESP.restart();
+        }
+      }
+    }
+};
+
+// ================= SETUP =================
+void setup() {
+  Serial.begin(115200);
+  
+  pinMode(BTN_FUNC_PIN, INPUT_PULLUP);
+  pinMode(BTN_TRIG_PIN, INPUT_PULLUP);
+  esp_sleep_enable_ext0_wakeup((gpio_num_t)BTN_FUNC_PIN, 0);
+
+  ledcAttach(LED_PIN, 5000, 8);
+  ledcAttach(LASER_PIN, 5000, 8);
+  
+  // 开机特效
+  for(int i=0; i<2; i++) {
+    ledcWrite(LED_PIN, 150); delay(100);
+    ledcWrite(LED_PIN, 0);   delay(100);
+  }
+  ledcWrite(LED_PIN, 50);
+
+  setupCamera();
+
+  preferences.begin("wifi_config", true);
+  String ssid = preferences.getString("ssid", "");
+  String pass = preferences.getString("pass", "");
+  preferences.end();
+
+  if (ssid == "") {
+    sysState = STATE_PROVISION;
+    startBleProvisioning();
+  } else {
+    WiFi.begin(ssid.c_str(), pass.c_str());
+    sysState = STATE_CONNECTING;
+  }
+}
+
+// ================= LOOP =================
+void loop() {
+  if (sysState == STATE_PROVISION) {
+    static int bri = 0; static int dir = 5;
+    bri += dir; if(bri>=255 || bri<=0) dir = -dir;
+    ledcWrite(LED_PIN, bri); delay(20);
+    return;
+  }
+
+  if (sysState == STATE_CONNECTING) {
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.println("\n✅ IP: " + WiFi.localIP().toString());
+      Udp.begin(UDP_PORT);
+      
+      // 1. 触发接口 (App 喊这一嗓子就开始干活)
+      server.on("/trigger", HTTP_GET, [](){
+        server.send(200, "text/plain", "OK");
+        if (tacState == IDLE) {
+          tacState = START;
+          tacTimer = millis();
+          Serial.println("🚀 收到指令，序列启动");
+        }
+      });
+
+      // 2. 取图接口 - VGA (App 收到 UDP 通知后来取)
+      server.on("/latest_vga", HTTP_GET, [](){
+        if (fb_vga) {
+          server.sendHeader("Content-Type", "image/jpeg");
+          WiFiClient client = server.client();
+          client.write(fb_vga->buf, fb_vga->len);
+          Serial.println("📤 VGA 已发送");
+        } else {
+          server.send(404, "text/plain", "Not Ready");
+        }
+      });
+
+      // 3. 取图接口 - HD (App 收到 UDP 通知后来取)
+      server.on("/latest_hd", HTTP_GET, [](){
+        if (fb_hd) {
+          server.sendHeader("Content-Type", "image/jpeg");
+          WiFiClient client = server.client();
+          client.write(fb_hd->buf, fb_hd->len);
+          Serial.println("📤 HD 已发送");
+        } else {
+          server.send(404, "text/plain", "Not Ready");
+        }
+      });
+
+      server.begin();
+      sysState = STATE_RUNNING;
+    } else {
+      if (millis() > 30000) {
+        sysState = STATE_PROVISION;
+        startBleProvisioning();
+      }
+      delay(500);
+    }
+    return;
+  }
+
+  if (sysState == STATE_RUNNING) {
+    handleUdpDiscovery();
+    server.handleClient();
+    handlePhysicalControls();
+    
+    // 执行自主序列
+    if (tacState != IDLE) {
+      runAutonomousSequence();
+    }
+  }
+}
+
+// ================= V6.3 核心逻辑 =================
+
+void runAutonomousSequence() {
+  unsigned long elapsed = millis() - tacTimer;
+
+  // T+0.1s: 偷拍 VGA (静默)
+  if (tacState == START && elapsed >= 100) {
+    // 拍之前释放旧缓存
+    if (fb_vga) { esp_camera_fb_return(fb_vga); fb_vga = NULL; }
+    
+    // 拍第一张(废片)
+    takePictureToBuffer(0); // 0=VGA slot, 这里只是为了热机，不存也行，但存了保险
+    // 拍第二张(真图) - T+0.6s 逻辑合并在这里做也行，或者分开
+    tacState = SNAP_VGA;
+  }
+
+  // T+0.6s: 拍 VGA 并通知 App
+  else if (tacState == SNAP_VGA && elapsed >= 600) {
+    if (fb_vga) { esp_camera_fb_return(fb_vga); fb_vga = NULL; } // 扔掉0.1s那张
+    
+    takePictureToBuffer(0); // 拍新的 VGA
+    Serial.println("📸 VGA Captured");
+    
+    // 🔥 UDP 推送通知
+    Udp.beginPacket(Udp.remoteIP(), Udp.remotePort()); // 注意：这里需要知道 App IP
+    // 如果 App 发过 WHO_IS_TONI，我们知道 IP。
+    // 如果不知道，就发广播 255.255.255.255
+    Udp.print("EVENT:VGA_READY");
+    Udp.endPacket();
+    
+    tacState = WARMUP;
+  }
+
+  // T+0.6s - T+2.0s: 慢闪
+  else if (tacState == WARMUP && elapsed < 2000) {
+    int phase = (elapsed / 250) % 2; 
+    ledcWrite(LASER_PIN, phase == 0 ? 200 : 0);
+    ledcWrite(LED_PIN, phase == 0 ? 255 : 50);
+  }
+
+  // T+2.0s: 高清热机
+  else if (tacState == WARMUP && elapsed >= 2000) {
+    // 切换分辨率拍废片
+    if (fb_hd) { esp_camera_fb_return(fb_hd); fb_hd = NULL; }
+    takePictureToBuffer(1); // 1=HD slot
+    // 拍完扔掉(或者覆盖)，此时还在 PSRAM 里
+    tacState = SNAP_HD;
+  }
+
+  // T+2.0s - T+3.0s: 快闪 -> 锁定
+  else if (tacState == SNAP_HD && elapsed < 3000) {
+    if (elapsed < 2600) {
+       int phase = (elapsed / 100) % 2;
+       ledcWrite(LASER_PIN, phase == 0 ? 255 : 0);
+       ledcWrite(LED_PIN, phase == 0 ? 255 : 20);
+    } else {
+       ledcWrite(LASER_PIN, 255); // 锁定
+       ledcWrite(LED_PIN, 150);
+    }
+  }
+
+  // T+3.0s: 决战拍大图
+  else if (tacState == SNAP_HD && elapsed >= 3000) {
+    ledcWrite(LASER_PIN, 0);
+    ledcWrite(LED_PIN, 255); // 补光
+    delay(50);
+    
+    if (fb_hd) { esp_camera_fb_return(fb_hd); fb_hd = NULL; }
+    takePictureToBuffer(1); // 拍最终 HD
+    Serial.println("📸 HD Captured");
+    
+    // 🔥 UDP 推送通知
+    Udp.beginPacket(Udp.remoteIP(), Udp.remotePort());
+    Udp.print("EVENT:HD_READY");
+    Udp.endPacket();
+    
+    ledcWrite(LED_PIN, 20); // 复位
+    tacState = IDLE; // 结束
+  }
+}
+
+// 📸 拍照到底层缓存
+void takePictureToBuffer(int slot) {
+  sensor_t * s = esp_camera_sensor_get();
+  if (slot == 0) s->set_framesize(s, FRAMESIZE_VGA);
+  else s->set_framesize(s, FRAMESIZE_QXGA);
+  
+  // 核心：camera_fb_get 会申请新内存，我们需要手动管理指针
+  camera_fb_t * new_fb = esp_camera_fb_get();
+  
+  if (!new_fb) { Serial.println("❌ FB Alloc Fail"); return; }
+  
+  if (slot == 0) fb_vga = new_fb;
+  else fb_hd = new_fb;
+}
+
+// ================= 其他辅助函数 (保持不变) =================
+void handleUdpDiscovery() {
+  int packetSize = Udp.parsePacket();
+  if (packetSize) {
+    int len = Udp.read(packetBuffer, 255);
+    if (len > 0) packetBuffer[len] = 0;
+    String req = String(packetBuffer);
+    if (req.indexOf("WHO_IS_TONI") != -1) {
+      String reply = "I_AM_TONI,SSID=" + WiFi.SSID() + ",IP=" + WiFi.localIP().toString();
+      Udp.beginPacket(Udp.remoteIP(), Udp.remotePort());
+      Udp.print(reply);
+      Udp.endPacket();
+    }
+  }
+}
+
+void handlePhysicalControls() {
+  int btnState = digitalRead(BTN_FUNC_PIN);
+  if (btnState == LOW) { 
+    if (!funcBtnPressed) { funcBtnPressed = true; funcBtnTime = millis(); }
+    if (millis() - funcBtnTime > 2000) enterDeepSleep(); 
+  } else {
+    if (funcBtnPressed && millis() - funcBtnTime < 2000) {
+      isArmed = !isArmed;
+      ledcWrite(LED_PIN, isArmed ? 255 : 0); delay(100); 
+      ledcWrite(LED_PIN, 0); delay(100);
+    }
+    funcBtnPressed = false;
+  }
+
+  if (isArmed && tacState == IDLE) {
+    static int lastTrig = HIGH;
+    int trig = digitalRead(BTN_TRIG_PIN);
+    if (lastTrig == HIGH && trig == LOW) {
+      delay(20);
+      if (digitalRead(BTN_TRIG_PIN) == LOW) {
+        Serial.println("🔘 Trigger!");
+        tacState = START; // 启动序列
+        tacTimer = millis();
+      }
+    }
+    lastTrig = trig;
+  }
+}
+
+void enterDeepSleep() {
+  ledcWrite(LED_PIN, 0); ledcWrite(LASER_PIN, 0);
+  esp_deep_sleep_start();
+}
+
+void startBleProvisioning() {
+  BLEDevice::init(DEVICE_NAME);
+  BLEServer *pServer = BLEDevice::createServer();
+  BLEService *pService = pServer->createService(SERVICE_UUID);
+  BLECharacteristic *pCharacteristic = pService->createCharacteristic(
+                                         CHARACTERISTIC_UUID,
+                                         BLECharacteristic::PROPERTY_WRITE
+                                       );
+  pCharacteristic->setCallbacks(new MyCallbacks());
+  pService->start();
+  BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
+  pAdvertising->addServiceUUID(SERVICE_UUID);
+  pAdvertising->setScanResponse(true);
+  pAdvertising->setMinPreferred(0x06); 
+  BLEDevice::startAdvertising();
+}
+
+void setupCamera() {
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer = LEDC_TIMER_0;
+  config.pin_d0 = 8; config.pin_d1 = 9; config.pin_d2 = 40; config.pin_d3 = 39;
+  config.pin_d4 = 41; config.pin_d5 = 42; config.pin_d6 = 12; config.pin_d7 = 11;
+  config.pin_xclk = 10; config.pin_pclk = 13; config.pin_vsync = 38; config.pin_href = 47;
+  config.pin_sscb_sda = 4; config.pin_sscb_scl = 5; config.pin_pwdn = -1; config.pin_reset = -1;
+  config.xclk_freq_hz = 20000000;
+  config.pixel_format = PIXFORMAT_JPEG;
+  config.frame_size = FRAMESIZE_SVGA; 
+  config.jpeg_quality = 12;
+  config.fb_count = 2; // 关键：开启 PSRAM 双缓冲
+  config.fb_location = CAMERA_FB_IN_PSRAM;
+  
+  if (esp_camera_init(&config) != ESP_OK) Serial.println("❌ Cam Init Fail");
+  else Serial.println("✅ Cam Ready");
+}
